@@ -1,0 +1,51 @@
+name: fish-audio
+version: 1.8.0
+description: "Fish Audio voices for Hermes: expressive text-to-speech, speech-to-text, a searchable voice library, voice cloning and voice design, in the CLI, every messaging gateway and the Desktop app. Most calls are paid Fish Audio API requests billed to your Fish account; the Disclosure section of the README lists what is billed, sent and stored."
+author: Electric Sheep
+kind: standalone
+manifest_version: 2
+api_version: 1
+requires_hermes: ">=0.21.5"
+license: Apache-2.0
+homepage: https://github.com/100yenadmin/fish-audio-hermes
+tags: [voice, tts, stt, speech, fish-audio, voice-cloning]
+requires_env:
+  - name: FISH_API_KEY
+    description: "Fish Audio API key (free to create)"
+    url: "https://fish.audio/app/api-keys"
+    secret: true
+config_schema:
+  api_key:
+    type: secret
+    env: FISH_API_KEY
+    label: "Fish Audio API key"
+    description: "Create one free at https://fish.audio/app/api-keys"
+  base_url:
+    type: str
+    default: "https://api.fish.audio"
+    label: "API base URL"
+    description: "Only change this for an enterprise self-hosted Fish Audio deployment (https, or http on loopback)."
+  streaming:
+    type: str
+    choices: [auto, "off"]
+    default: auto
+    label: "Streaming voice"
+    description: "auto streams speech sentence by sentence in Desktop and CLI voice mode on Hermes 0.21.6 or later; off uses whole-file synthesis."
+  transport:
+    type: str
+    choices: [http, ws]
+    default: http
+    label: "Streaming transport"
+    description: "Diagnostics only. http (chunked POST, lowest measured first-audio latency) or ws (Fish's live WebSocket)."
+  allow_free_model:
+    type: bool
+    default: true
+    label: "Allow s2.1-pro-free"
+    description: "Off: always use s2.1-pro, never s2.1-pro-free, even when it is asked for by name. Fish announced s2.1-pro-free as free through 30 November 2026 and may use its requests to improve its models."
+  operator_account:
+    type: bool
+    default: false
+    label: "Operator-managed account"
+    description: "Turn on when the Fish account belongs to this agent's operator. Hides the balance, plan, billing links and the account's own voices from the agent's users, and sends key or credit problems to the operator. Restart the gateway to update tool descriptions."
+provides_tools: [fish_speak, fish_voices, fish_transcribe]
+provides_hooks: [transform_llm_output, pre_tool_call]

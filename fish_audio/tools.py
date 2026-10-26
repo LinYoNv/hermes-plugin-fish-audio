@@ -1,0 +1,168 @@
+import re
+"""Three explicit Fish Audio tools; ordinary read-aloud stays with Hermes TTS."""
+from uuid import uuid4
+
+from . import client, hooks, media, models, settings, tags
+from .models import MODELS
+from .secrets import fish_api_key
+from .tool_support import require, voice_id, run
+
+BILLING = " Calls are billed to the user's Fish Audio account."
+SPEAK_DESCRIPTION = ("Use for expressive or multi-speaker speech with Fish Audio emotion cues like [excited] "
+                     "or [whispering]. Voices accept saved names. For plain read-aloud use text_to_speech." + BILLING)
+
+
+def _speak(args, key, base, session, *, record_media=True):
+    text = args.get("text")
+    require(isinstance(text, str) and bool(text.strip()), "Nothing to say: the text is empty.")
+    model, source = settings.resolve_model_source(args.get("model"), key=key, base_url=base, prefer_call=True)
+    defaulted = source != "configured"
+    model = models.effective_model(model)
+    row = next(row for row in MODELS if row["id"] == model)
+    nested = settings._mapping(settings._mapping(settings._config().get("tts")).get("fish-audio"))
+    p_voice, _p_src = settings.active_session_persona_voice(session, nested)
+    voice = args.get("voice")
+    if p_voice is not None:
+        # 会话绑定的人格专属音色优先（除非显式传入了另一个合法的 32 位音色 ID）
+        explicit_v = settings.resolve_voice(voice) if voice is not None else None
+        voice = explicit_v if (explicit_v and re.fullmatch(r"[0-9a-f]{32}", str(voice or "").strip())) else p_voice
+    elif voice is not None:
+        voice = settings.resolve_voice(voice)
+        require(voice is not None, settings.UNKNOWN_VOICE)
+    else:
+        voice = nested.get("voice") if voice_id(nested.get("voice")) else None
+    if "speakers" in args:
+        speakers = args["speakers"]
+        require(isinstance(speakers, list) and 2 <= len(speakers) <= 4,
+                "speakers must contain 2–4 voice ids or saved names.")
+        speakers = [settings.resolve_voice(v) for v in speakers]
+        require(all(v is not None for v in speakers), settings.UNKNOWN_VOICE)
+        require(row["multi_speaker"], "Multi-speaker speech is supported by: " +
+                ", ".join(r["id"] for r in MODELS if r["multi_speaker"]))
+        voice = speakers
+    fmt = args.get("format", "ogg")
+    require(fmt in {"ogg", "mp3", "wav"}, "format must be ogg, mp3 or wav.")
+    if "speed" in args:
+        speed = args["speed"]
+        require(settings._number(speed) and 0.5 <= speed <= 2, "speed must be between 0.5 and 2.0.")
+    else:
+        speed = nested.get("speed", 1.0)
+        if not settings._number(speed):
+            settings._warn("speed")
+            speed = 1.0
+        speed = max(0.5, min(2.0, speed))
+    params = {"text": tags.adapt_tags(text, row["family"]), "model": model, "model_defaulted": defaulted,
+              "format": "opus" if fmt == "ogg" else fmt, "prosody": {"speed": speed}}
+    if voice is not None:
+        params["reference_id"] = voice
+    settings.apply_knobs(params, nested)
+    if "language" in args:
+        require(settings._valid("language", args["language"]),
+                "language must be a BCP-47 tag such as en, es-MX or zh-CN: letters, digits, - and _, at most 35 characters.")
+        params["language"] = args["language"]
+    if "pronunciations" in args:
+        entries = args["pronunciations"]
+        require(isinstance(entries, dict) and len(entries) <= 200, "pronunciations allows at most 200 entries.")
+        dictionary = [{"items": [{"key": k, "value": v} for k, v in entries.items()]}]
+        require(settings._dictionary(dictionary), "Invalid pronunciation entry.")
+        configured = params.get("pronunciation_dictionary", [])
+        merged = {item["key"]: item for group in configured for item in group.get("items", [])}
+        merged.update({item["key"]: item for item in dictionary[0]["items"]})
+        items = list(merged.values())  # Fish allows at most 5000 items per group (and 3 groups)
+        require(len(items) <= 15000, f"Pronunciations: {len(items):,} entries after merging with the configured "
+                "dictionary; Fish allows 15,000. Remove configured entries or pass fewer.")
+        dictionary = [{"items": items[i:i + 5000]} for i in range(0, len(items), 5000)]
+        require(settings._dictionary(dictionary), "Invalid pronunciation entry.")
+        params["pronunciation_dictionary"] = dictionary
+    path = media.audio_output_dir() / f"fish-{uuid4().hex[:12]}.{fmt}"
+    require("timestamps" not in args or type(args["timestamps"]) is bool, "timestamps must be boolean.")
+    events = [] if args.get("timestamps") else None
+    client.tts_to_file(params, key, base, str(path), events=events)
+    as_voice = fmt in {"ogg", "mp3"}
+    tag = ("[[audio_as_voice]]\n" if as_voice else "") + f"MEDIA:{path}"
+    if record_media:
+        hooks.record(session, path, as_voice)
+    result = {"file_path": str(path), "media_tag": tag, "model": model, "voice": voice, "billing": "fish-audio",
+              "note": ("Include media_tag verbatim on its own line so the user receives the audio, and add one short line "
+                       "of text: a reply that is only media_tag can leave a stray \"MEDIA\" message in streaming chats.")}
+    if source == "wallet" and settings.operator_account():
+        del result["model"]  # A wallet-chosen default follows the operator's wallet, which the agent's users don't see.
+    elif defaulted and model == "s2.1-pro-free":
+        result["notice"] = settings.free_model_notice()
+    if events is not None:
+        from .transcribe import speech_timestamps
+        # The billed audio is already saved: a subtitle failure must not hide it.
+        try:
+            result.update(speech_timestamps(events, path))
+        except Exception as exc:
+            result["timestamps_error"] = f"The audio is ready, but its timestamps could not be processed ({type(exc).__name__})."
+    return result
+
+
+def fish_speak(args, session_id="", task_id="", tool_call_id="", **kwargs):
+    return run(_speak, args, session_id or task_id)
+
+
+def fish_voices(args, session_id="", task_id="", tool_call_id=""):
+    from .voices import execute
+    return run(execute, args, session_id)
+
+
+def fish_transcribe(args, session_id="", task_id="", tool_call_id=""):
+    from .transcribe import execute
+    return run(execute, args, session_id)
+
+
+def _field(typ, **constraints):
+    return {"type": typ, **constraints}
+
+
+S = _field("string")
+B = _field("boolean")
+STRINGS = _field("array", items=S)
+VOICE = _field("string", pattern="^[A-Za-z0-9_-]{8,128}$")
+VOICE_REF = _field("string", pattern="^[A-Za-z0-9_-]{2,128}$", description="voice id or saved name")
+SCHEMAS = {
+    "fish_speak": {"text": S, "voice": VOICE_REF, "model": _field("string", enum=[r["id"] for r in MODELS], description="s1 is deprecated; from 2026-12-31 requests use s2.1-pro."),
+        "format": _field("string", enum=["ogg", "mp3", "wav"], default="ogg"),
+        "language": _field("string", maxLength=35, pattern="^[A-Za-z0-9_-]*$", description="Spelling of numbers, dates and units, and word timestamps; never the voice."),
+        "speakers": _field("array", items=VOICE_REF, minItems=2, maxItems=4),
+        "speed": _field("number", minimum=0.5, maximum=2), "timestamps": B,
+        "pronunciations": _field("object", additionalProperties=S, maxProperties=200)},
+    "fish_voices": {"action": _field("string", enum=["search", "mine", "get", "clone", "design", "save", "update", "delete"]),
+        "query": S, "language": S, "tags": STRINGS, "sort": _field("string", enum=["score", "task_count", "created_at"]),
+        "author_id": _field("string", pattern="^[A-Za-z0-9_-]{1,64}$"),
+        "title_language": {"oneOf": [S, _field("array", items=S, minItems=1, maxItems=10)]}, "licensed": B,
+        "page": _field("integer", minimum=1), "page_size": _field("integer", minimum=1, maximum=20),
+        "voice_id": VOICE, "title": S, "description": S,
+        "sample_paths": _field("array", items=S, minItems=1, maxItems=20), "texts": STRINGS,
+        "visibility": _field("string", enum=["private", "unlist"]),
+        "generate_sample": B, "cover_image_path": S,
+        "enhance_audio_quality": _field("boolean", default=True), "consent": B,
+        "instruction": _field("string", minLength=1, maxLength=2000), "reference_text": _field("string", maxLength=150),
+        "num_step": _field("integer", minimum=1, maximum=128),
+        "guidance_scale": _field("number", minimum=0), "instruct_guidance_scale": _field("number", minimum=0),
+        "n": _field("integer", minimum=1, maximum=4, default=2), "seed": _field("integer"),
+        "speed": _field("number", exclusiveMinimum=0, maximum=3), "design_token": S},
+    "fish_transcribe": {"file_path": S, "model": _field("string", enum=["transcribe-1-pro", "transcribe-1"], default="transcribe-1-pro"),
+        "language": S, "timestamps": _field("boolean", default=True),
+        "diarize": _field("string", enum=["auto", "true", "false"], default="auto"),
+        "num_speakers": _field("integer", minimum=1), "min_speakers": _field("integer", minimum=1),
+        "max_speakers": _field("integer", minimum=1), "tag_audio_events": _field("boolean", default=True),
+        "srt": _field("boolean", default=False)},
+}
+DESCRIPTIONS = {"fish_speak": SPEAK_DESCRIPTION,
+    "fish_voices": "Search and manage Fish voices, clone with speaker consent, or design and save a voice." + BILLING,
+    "fish_transcribe": "Transcribe local audio with speaker turns, emotion cues, timestamps and optional SRT." + BILLING}
+REQUIRED = {"fish_speak": ["text"], "fish_voices": ["action"], "fish_transcribe": ["file_path"]}
+
+
+def register(ctx):
+    # Description changes take effect after a gateway restart (registration time).
+    operator = settings.operator_account()
+    for name in SCHEMAS:
+        description = DESCRIPTIONS[name].removesuffix(BILLING) if operator else DESCRIPTIONS[name]
+        schema = {"name": name, "description": description,
+                  "parameters": {"type": "object", "properties": SCHEMAS[name], "required": REQUIRED[name]}}
+        ctx.register_tool(name=name, toolset="fish_audio", schema=schema, handler=globals()[name],
+                          check_fn=lambda: bool(fish_api_key()), description=description, emoji="🐟")

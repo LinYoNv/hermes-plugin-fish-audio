@@ -1,0 +1,109 @@
+"""Shared test fixtures.
+
+``FakeCtx`` records what ``register`` registers so tests assert the plugin's public surface
+without importing Hermes. Integration tests that mount through Hermes's real loader live in
+``tests/integration/`` and run only inside a Hermes venv (see CI).
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import copy
+import sys
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Dict, List
+
+import pytest
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def active_free_model_date(monkeypatch):
+    """Every test sees 31 October 2026 unless it sets its own date, so no expectation changes with the wall clock."""
+    from datetime import datetime
+    from types import SimpleNamespace
+    from fish_audio import models
+    monkeypatch.setattr(models, "datetime", SimpleNamespace(now=lambda tz: datetime(2026, 10, 31, tzinfo=tz)))
+
+
+@pytest.fixture
+def managed_layer(monkeypatch):
+    def install(layer, *, rule="upstream"):
+        assert rule in {"upstream", "fork"}
+        def flatten(node, prefix=""):
+            keys = set()
+            for name, value in node.items():
+                dotted = f"{prefix}.{name}" if prefix else name
+                if isinstance(value, dict) and (value or rule == "fork"):
+                    keys.update(flatten(value, dotted))
+                else:
+                    keys.add(dotted)
+            return keys
+        module = ModuleType("hermes_cli.managed_scope")
+        module.load_managed_config = lambda: copy.deepcopy(layer)
+        module.managed_config_keys = lambda: flatten(module.load_managed_config())
+        monkeypatch.setattr(sys.modules["hermes_cli"], "managed_scope", module, raising=False)
+        monkeypatch.setitem(sys.modules, "hermes_cli.managed_scope", module)
+        return module
+    return install
+
+
+class FakeCtx:
+    def __init__(self) -> None:
+        self.tts_providers: List[Any] = []
+        self.stt_providers: List[Any] = []
+        self.tools: Dict[str, Dict[str, Any]] = {}
+        self.hooks: Dict[str, List[Any]] = {}
+        self.commands: Dict[str, Dict[str, Any]] = {}
+        self.cli_commands: Dict[str, Dict[str, Any]] = {}
+        self.skills: Dict[str, Path] = {}
+        self.skill_descriptions: Dict[str, str] = {}
+
+    def register_tts_provider(self, provider: Any) -> None:
+        self.tts_providers.append(provider)
+
+    def register_transcription_provider(self, provider: Any) -> None:
+        self.stt_providers.append(provider)
+
+    def register_tool(self, name: str, **kwargs: Any) -> None:
+        self.tools[name] = kwargs
+
+    def register_hook(self, name: str, fn: Any) -> None:
+        self.hooks.setdefault(name, []).append(fn)
+
+    def register_command(self, name: str, **kwargs: Any) -> None:
+        self.commands[name] = kwargs
+
+    def register_cli_command(self, name: str, **kwargs: Any) -> None:
+        self.cli_commands[name] = kwargs
+
+    def register_skill(self, name: str, path: Any, description: str = "") -> None:
+        self.skills[name] = Path(path)
+        self.skill_descriptions[name] = description
+
+
+def load_plugin_package():
+    """Import the plugin root as a package named like Hermes's loader does (hyphen -> underscore)."""
+    name = "hermes_plugins_test.fish_audio"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, PLUGIN_ROOT / "__init__.py", submodule_search_locations=[str(PLUGIN_ROOT)]
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("hermes_plugins_test", type(sys)("hermes_plugins_test"))
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def fake_ctx() -> FakeCtx:
+    return FakeCtx()
+
+
+@pytest.fixture
+def plugin():
+    return load_plugin_package()

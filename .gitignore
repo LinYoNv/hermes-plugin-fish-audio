@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+node_modules/
+dist-tmp/
+.DS_Store
+/specs/
+.hermes-pin/
+.pytest-tmp/
+.test-home/
+pinned/
+coverage/
+devtools/node_modules/
+devtools/pinned/
+acceptance-out/

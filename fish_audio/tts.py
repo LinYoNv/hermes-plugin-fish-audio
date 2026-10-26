@@ -1,0 +1,93 @@
+"""Hermes's ordinary text_to_speech provider."""
+from ._compat import TTSProvider
+from . import client, models, settings
+from .models import MODELS
+from .secrets import fish_api_key
+from .settings import free_model_notice, resolve_tts
+from .tags import adapt_tags
+from .errors import FishAudioError
+from .state import record_failure
+
+SETUP_MESSAGE = ("Set up Fish Audio with hermes tools or Desktop ▸ Settings ▸ Plugins ▸ Fish Audio ▸ Agent settings"
+                 " (on older Desktop, the gear on the fish-audio row in Capabilities ▸ Plugins). "
+                 "Get an API key at https://fish.audio/app/api-keys")
+
+
+def setup_message():
+    return "Ask the operator of this agent to finish the Fish Audio setup." if settings.operator_account() else SETUP_MESSAGE
+
+
+class FishAudioTTSProvider(TTSProvider):
+    name = "fish-audio"
+    display_name = "Fish Audio"
+    voice_compatible = True
+    # Hermes's plugin streaming hook (#133723) reads these with is_available() whenever a reply picks
+    # its streamer; Hermes builds without the hook never read them.
+    stream_sample_rate = 24000
+
+    @property
+    def streams_pcm(self):
+        from .streaming import streaming_available
+        return streaming_available()
+
+    def stream(self, text, *, voice=None, model=None, speed=None, format="pcm", **extra):
+        """Hook contract: int16 mono PCM; per-call voice, model and speed go through the one settings resolver."""
+        from .streaming import stream_pcm
+        return stream_pcm(text, voice=voice, model=model, speed=speed)
+
+    def is_available(self):
+        try:
+            return bool(fish_api_key())
+        except Exception:
+            return False
+
+    def get_setup_schema(self):
+        return {"name": "Fish Audio", "badge": "free model" if models.free_model_phase() != "ended" else "", "tag": "Expressive voices, voice cloning, 80+ languages",
+                "env_vars": [{"key": "FISH_API_KEY", "prompt": "Fish Audio API key", "url": "https://fish.audio/app/api-keys"}]}
+
+    def list_models(self):
+        return [dict(row, display=models.display(row)) for row in MODELS]
+
+    def default_voice(self):
+        return None
+
+    def list_voices(self):
+        try:
+            from .tool_support import voice_id
+            saved = settings.aliases()
+            voices = [{"id": voice, "display": name} for name, voice in sorted(saved.items())]
+            current = settings._mapping(settings._mapping(settings._config().get("tts")).get("fish-audio")).get("voice")
+            if voice_id(current) and current not in saved.values():  # the rule synthesis applies to tts.fish-audio.voice
+                voices.append({"id": current, "display": "Current voice"})
+            return voices
+        except Exception:
+            return []
+
+    def warm(self):
+        pass
+
+    def release(self):
+        pass
+
+    def synthesize(self, text, output_path, *, voice=None, model=None, speed=None, format="mp3", **extra):
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Nothing to say: the text is empty.")
+        key = fish_api_key()
+        if not key:
+            raise ValueError(setup_message())
+        params, final_path = resolve_tts(voice, model, speed, format, output_path, key=key)
+        base_url = params.pop("base_url")
+        params["model"] = models.effective_model(params["model"])
+        family = next(row["family"] for row in MODELS if row["id"] == params["model"])
+        params["text"] = adapt_tags(text, family)
+        metadata = extra.get("result_metadata")
+        if isinstance(metadata, dict) and params["model_defaulted"] and params["model"] == "s2.1-pro-free" and not settings.operator_account():
+            metadata["fish_audio_notice"] = free_model_notice()
+        try:
+            client.tts_to_file(params, key, base_url, final_path)
+        except FishAudioError as exc:
+            record_failure(exc.kind, str(exc))
+            raise
+        if isinstance(metadata, dict):
+            metadata.update(primary_provider="fish-audio", fallback_active=False)
+        return final_path

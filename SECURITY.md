@@ -1,0 +1,90 @@
+# Security policy
+
+Report privately using [the GitHub advisory form](https://github.com/100yenadmin/fish-audio-hermes/security/advisories/new).
+We aim to acknowledge reports within 3 business days and to share a decision or fix plan within 14 days.
+
+## Scope
+
+- Exposure of the Fish API key through the plugin.
+- Audio or text sent to a destination the user did not choose.
+- Reads outside the plugin's own data, including protected files or another profile's data.
+
+## Out of scope
+
+- Fish Audio's own API or service: report to Fish Audio.
+- Hermes Agent core: report to the upstream security channel linked below.
+
+## Reporting a vulnerability
+
+Please report vulnerabilities privately through GitHub's **Report a vulnerability** button (Security ▸ Advisories)
+on this repository. Do not open a public issue. We aim to acknowledge reports within three working days.
+
+Issues in Fish Audio's API or services belong with Fish Audio; issues in Hermes Agent itself belong with
+[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent/security).
+
+## What the plugin does with your data
+
+- **Where requests go.** Every request goes to Fish Audio at `api.fish.audio`, or to the `base_url` you configure;
+  whatever host you configure receives your API key and the requests below. The plugin sends nothing anywhere
+  else and collects no telemetry.
+- **What requests carry.** Your API key; the text you ask it to speak; the audio you ask it to transcribe or clone,
+  with the uploaded file names; voice titles, tags, descriptions, cover images and design instructions for
+  voice-library actions;
+  and wallet and plan reads for balance and model choice. Headers name the plugin and its version, and pass on an
+  OpenTelemetry trace context when one is active.
+- **Billing.** Synthesis, transcription, cloning and voice design are paid Fish Audio requests billed to your Fish
+  account, except requests on `s2.1-pro-free` while Fish offers it free (announced through 30 November 2026). Fish
+  Audio may use free-model requests to improve its models.
+- **Keys.** Hermes stores your key in the active profile's `.env`. The plugin reads it through the profile's secret
+  scope, so when one Hermes process serves several profiles each uses its own key; a single-profile install may
+  also read `FISH_API_KEY` from the process environment. Keys are never logged or included in error messages, tool
+  results or command output.
+- **Files.** Files the model tools upload (`fish_voices` clone samples, `fish_transcribe` recordings) must be
+  regular audio files, and `fish_voices` cover images (`cover_image_path`) regular PNG, JPEG or WebP files. They refuse symlinks, Hermes config and secret files, and SSH or cloud credential paths.
+  Audio that Hermes itself hands to the speech-to-text provider (voice notes, dictation) is read as given.
+- **Approvals.** Cloning and deleting voices from chat or the model tools go through Hermes's approval gate and
+  follow your Hermes approval settings. By default Hermes asks you, and refuses when no one is there to answer.
+
+## Desktop Voices page
+
+The Desktop Voices page adds gateway routes under /api/plugins/fish-audio/, behind the Hermes dashboard's
+existing authentication. On that page, previews, clones and voice designs are billed; cloning a voice or saving a
+designed one creates a voice in your Fish account; cloning and deleting are confirmed on the page (a
+speaker-consent box, a typed voice name) instead of through Hermes's approval gate; and Use sets the profile's
+Fish voice, and its speech provider when none is set. Preview and design audio files are deleted from the
+gateway once returned; a design's audio is held in gateway memory so you can save it, until it is saved, a
+later design or save finds it over an hour old, or the gateway stops; clone uploads are deleted after the
+clone, or by the next upload once idle for 15 minutes. With a key set, Desktop reads your Fish wallet when an
+agent is selected and about every five minutes, for the status-bar credit; favourites stay in Desktop's plugin
+storage on that computer, and fetched previews stay in the window's memory until it closes.
+
+- The routes use the same key, settings and Fish Audio requests as the tools, for the profile Desktop has
+  selected; with no key they refuse without calling Fish Audio. Responses never carry the key, and a voice-design
+  signature stays on the gateway behind an account-bound token that is refused once an hour old.
+- **Use** writes the voice and, when unset, the speech provider into the selected profile's `config.yaml`,
+  with the same writer as `/fish use`.
+- Clone uploads arrive in chunks of JSON and base64, never as multipart forms. The gateway names each upload
+  itself (a random id, never a client path), writes it with owner-only permissions under the profile's
+  `cache/fish-audio/uploads`, refuses symlinks along that path inside the profile, caps it at 10 MB per file and 3 files, and checks that it is audio
+  before sending it to Fish Audio. A clone is refused unless the consent box is ticked.
+- Deleting checks that the voice belongs to your Fish account first.
+
+## Streaming voice
+
+The plugin streams only through Hermes's plugin streaming hook: its TTS provider declares `streams_pcm` and
+`stream_sample_rate`, and Hermes calls its `stream()`. It registers nothing into Hermes's internal streaming registry
+and never rebinds Hermes module attributes. Hermes builds without the hook, and the plugin host process
+(`plugins.isolation: host`), use whole-file speech.
+
+## Live dictation
+
+With `stt.provider: fish-audio` and `stt.streaming: true` on Hermes 0.21.6+, microphone PCM audio streams while you
+speak to `wss://api.fish.audio/compat/elevenlabs/v1/speech-to-text/realtime`, authenticated with your profile's key in
+the `xi-api-key` header. The key and safe error text are captured in the opener's profile scope. Only committed
+phrases are transcribed and billed, each rounded up to a second at Fish's ASR price. A phrase is committed only when
+it holds at least 300 ms of sound above Hermes's `voice.silence_threshold` (100 ms for a last word after an earlier
+phrase), so a pause is never committed on its own. After a phrase is committed, nothing is streamed until sound
+returns, except the half second just before it. Failed live sessions fall back to file transcription. A self-hosted
+`base_url` on a remote host, and plugin-host isolation, keep the file path. A loopback `base_url` (localhost, 127.0.0.1,
+::1) is treated as a local Fish proxy and receives the live microphone audio over ws:// (wss:// for https). Abandoned
+sockets close 30 seconds after the last audio, or 3500 seconds after connecting.
